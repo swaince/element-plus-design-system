@@ -165,10 +165,64 @@ cat node_modules/element-plus/theme-chalk/src/common/var.scss
 
 **允许的硬编码**：RGB 分量（技术限制）、`border-width`、`border-style`（设计系统通常不定义这些）。
 
-### 第五步：编写 component-overrides.css
+### 第五步：扫描组件源码 + 编写 component-overrides.css
 
-CSS 变量无法覆盖的细节：按钮 hover `translate(6px)` 动画、标签 `text-transform: uppercase`、
-表格表头 uppercase、特定组件的阴影应用范围等。
+CSS 变量只能覆盖组件中使用了 `var(--el-*)` 的样式。Element Plus 每个组件的 SCSS 中仍有大量**硬编码数值**不受变量控制，必须通过 `component-overrides.css` 手动覆盖。
+
+**扫描流程：**
+
+1. 逐个读取 `node_modules/element-plus/theme-chalk/src/` 下每个组件的 SCSS 文件
+2. 找出以下 4 类硬编码：
+   - **颜色硬编码**（如 `#fff`、`#409eff`、`rgb(209,219,229)`）——最危险，暗色模式下必然出错
+   - **尺寸/间距硬编码**（如 `padding: 0 20px`、`width: 48px`）
+   - **字号/字重硬编码**（如 `font-size: 12px`、`font-weight: 600`）
+   - **动画/过渡硬编码**（如 `transition: 0.3s`、`translate3d(-20px)`）
+3. 判断每处硬编码是否可用现有 `--el-*` 变量覆盖——如果可以，在 bridge 中补充变量；如果不能，写入 `component-overrides.css`
+4. 完成后运行 `pnpm dev`，在浏览器中**切换暗色模式**逐组件验证
+
+**高危硬编码示例（从实际审计中发现的）：**
+
+| 组件 | 文件 | 硬编码 | 问题 | 修复 |
+|------|------|--------|------|------|
+| Table 必填标记 | `table.scss` | `background: #ff4d51` | 红色不跟随主题 | `.el-table th.required > div::before { background: var(--el-color-danger) }` |
+| Table 固定列补丁 | `table.scss` | `background: #fff` | 暗色模式白色补丁 | `.el-table__fixed-right-patch { background: var(--el-bg-color) }` |
+| Tabs 边框卡片 | `tabs.scss` | `border-right-color: #fff` | 暗色模式不可见 | `.el-tabs__item.is-left.is-active { border-right-color: var(--el-bg-color-overlay) }` |
+| Tabs 边框线 | `tabs.scss` | `rgb(209,219,229)` | 硬编码颜色 | `.el-tabs--border-card > .el-tabs__header .el-tabs__item.is-active { border-top-color: var(--el-border-color-lighter) }` |
+
+**必须额外处理的组件变体：**
+
+某些组件的 CSS 变量覆盖会对子变体产生副作用，需分别处理：
+
+| 场景 | 问题 | 修复 |
+|------|------|------|
+| Button plain | `.el-button--primary { background }` 覆盖了 plain 的透明背景 | 追加 `.el-button.is-plain { background: transparent }` 和 `.el-button--primary.is-plain { color }` |
+| Button disabled | disabled 状态颜色过于暗淡 | 检查 `--el-disabled-*` 变量是否正确桥接 |
+| Tag dark/plain | `effect="dark"` 和 `effect="plain"` 使用不同的背景/文字色 | 覆盖 `.el-tag--dark` 和 `.el-tag--plain` 的颜色组合 |
+| Table stripe | 斑马纹背景色 | 检查 `--el-table-striped-row-bg-color` 等组件专属变量 |
+| Tabs border-card | 与其他 tabs 类型共用不同的激活态背景色 | 覆盖 `.el-tabs--border-card .el-tabs__item.is-active { background }` |
+
+**前景色与背景色对比度检查（ELPT-CONTRAST）：**
+
+这是最容易遗漏的问题。在暗色模式和浅色模式之间切换时，以下位置需要逐个检查：
+
+- Plain 按钮的文字是否与背景融合（如蓝色文字在同样蓝色边框背景下辨识度低）
+- Tabs 激活态边框线在暗色模式下是否可见（白色边框线在白底或黑底黑边都不可见）
+- 输入框的 placeholder 文字是否有足够对比度
+- 表格悬停行背景色是否与文字有足够反差
+- 禁用状态文字和背景的对比度是否达到 3:1 以上
+
+**验证方式：** 在 `pnpm dev` 中打开浏览器 DevTools → 取色器检查文字色和背景色的对比度。切换 `.dark` class 后再检查一轮。
+
+**component-overrides.css 结构规范：**
+
+```css
+/* --- 组件名 --- */
+/* 每个覆盖规则上方注释说明覆盖原因（硬编码值 + 行号来源） */
+/* 表格硬编码覆盖：必填标记红色 (#ff4d51) → danger 色 */
+.el-table th.el-table__cell.required > div::before {
+  background: var(--el-color-danger);
+}
+```
 
 ### 第六步：串联导入
 
@@ -217,6 +271,26 @@ import { createApp } from "vue";    // 4. Vue
 
 createApp(App).mount("#app");
 ```
+
+- **`color-mix()` 只能用于语义色变体，中性表面色禁止混入品牌色**：Element Plus 的 `fill-color-*`、`disabled-bg-color` 等变量属于**组件内部表面层级**，原始值全部是中性灰（`#f0f2f5`、`#f5f7fa`、`#fafafa`），独立于主色。将它们写成 `color-mix(in srgb, var(--color-ds-primary), white 90%)` 会引入设计系统中不存在的淡蓝色调，导致 Tab 头、列表悬停态等大面积区域出现色偏。正确做法是从文字色或纯白/纯黑派生中性灰：
+```css
+/* ❌ 错误 — 品牌色泄漏到表面层 */
+--el-fill-color-light: color-mix(in srgb, var(--color-ds-primary), white 90%);
+
+/* ✅ 正确 — 中性灰度 */
+--el-fill-color-light: color-mix(in srgb, var(--color-ds-text-primary), white 97%);
+```
+- **组件覆盖需区分变体**：`.el-button--primary` 的 `background-color` 覆盖会影响所有 primary 按钮，包括 `.is-plain` 朴素变体。plain 按钮需要透明背景 + 主色文字，需单独定义：
+```css
+/* ❌ 只写了 base，plain 变体文字不可见 */
+.el-button--primary { background-color: var(--color-ds-primary); }
+
+/* ✅ 补充 plain 变体 */
+.el-button.is-plain { background-color: transparent; }
+.el-button--primary.is-plain { color: var(--color-ds-primary); border-color: var(--color-ds-primary); }
+```
+- **演示页面必须覆盖全部变体**：plain、disabled、不同 size（large/default/small）、不同 effect（dark/plain）、circle、closable 等变体都应在测试页面中出现。缺失的变体组合会导致样式问题在上线后才暴露。
+- **`color-mix()` 误用是最高频错误**：审计时把所有 bridge 文件中的 `color-mix()` 分类——引用品牌色的只能出现在 `--el-color-{type}-light-*` / `--el-color-{type}-dark-*` 中；引用中性色的只能出现在 `fill`、`disabled`、`border` 等表面变量中。交叉即错误。
 
 ## 文件模板
 
@@ -304,4 +378,6 @@ createApp(App).mount("#app");
 - [ ] 所有 `var(--*-ds-*)` 引用在 tokens.css 中是否存在？
 - [ ] tokens.css 中的字号/行高/字重/字间距是否与 DESIGN.md 逐行对应？
 - [ ] 设计系统的间距比例尺是否全部注册为令牌？
+- [ ] `color-mix()` 中品牌色是否只出现在语义色变体（`--el-color-*-light-*` / `--el-color-*-dark-*`）中，未泄漏到 `fill`、`disabled`、`border` 等中性表面变量？
+- [ ] 演示页面是否覆盖了全部变体（plain、disabled、circle、不同 size/effect）？
 - [ ] pnpm type-check 和 pnpm build-only 是否通过？
